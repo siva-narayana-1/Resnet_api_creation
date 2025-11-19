@@ -6,10 +6,8 @@ from flask import Flask, request, jsonify
 from PIL import Image
 import tensorflow as tf
 
-# ------------------------------
-# Basic App Setup
-# ------------------------------
 app = Flask(__name__)
+
 UPLOAD_DIR = "uploads"
 MODEL_DIR = "tflite_models"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -22,21 +20,22 @@ def normalize(text):
     return text.lower().strip().replace(" ", "_")
 
 
-# ------------------------------
-# Load Class JSON
-# ------------------------------
-CLASS_JSON = json.load(open("class.json"))
+# -----------------------------
+# CHECK API STATUS
+# -----------------------------
+@app.route("/", methods=["GET"])
+def home():
+    return "ResNet API is running!", 200
 
-# ------------------------------
-# Load ResNet evaluation metrics
-# ------------------------------
+
+# -----------------------------
+# Load Files
+# -----------------------------
+CLASS_JSON = json.load(open("class.json"))
 RESNET_JSON = json.load(open("model_evaluation_results_resnet.json"))
 RESNET_JSON = {normalize(k): v for k, v in RESNET_JSON.items()}
 
 
-# ------------------------------
-# Class → index mapping for all ResNet models
-# ------------------------------
 RESNET_MODEL_CLASS_INDEX = {
     "resnet_model_1":  {'apple_pie': 0, 'baked_potato': 1, 'burger': 2},
     "resnet_model_2":  {'butter_naan': 0, 'chai': 1, 'chapati': 2},
@@ -52,49 +51,44 @@ RESNET_MODEL_CLASS_INDEX = {
 }
 
 RESNET_MODEL_CLASS_INDEX = {
-    m.lower(): {normalize(k): v for k, v in data.items()}
-    for m, data in RESNET_MODEL_CLASS_INDEX.items()
+    m.lower(): {normalize(k): v for k, v in d.items()}
+    for m, d in RESNET_MODEL_CLASS_INDEX.items()
 }
 
-# ------------------------------
-# Download TFLite model (auto)
-# ------------------------------
+
+# -----------------------------
+# TFLite Loader
+# -----------------------------
 tflite_cache = {}
 
 
-def download_model(model_name):
+def download_resnet_model(model_name):
     url = f"{GCS_BUCKET}/{model_name}.tflite"
     save_path = os.path.join(MODEL_DIR, model_name + ".tflite")
 
-    try:
-        print("[INFO] Downloading:", url)
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
+    print("[INFO] Downloading:", url)
+    resp = requests.get(url, timeout=45)
+    resp.raise_for_status()
 
-        with open(save_path, "wb") as f:
-            f.write(resp.content)
+    with open(save_path, "wb") as f:
+        f.write(resp.content)
 
-        print("[INFO] Saved:", save_path)
-        return save_path
-
-    except Exception as e:
-        print("[ERROR] Download:", e)
-        return None
+    print("[INFO] Saved:", save_path)
+    return save_path
 
 
 def load_resnet_model(model_name):
     global tflite_cache
-    tflite_cache = {}  # Always keep only 1 model
+    tflite_cache = {}  # keep only 1
 
     local_path = os.path.join(MODEL_DIR, model_name + ".tflite")
 
     if not os.path.exists(local_path):
-        ok = download_model(model_name)
-        if ok is None:
-            return None
+        download_resnet_model(model_name)
 
     interpreter = tf.lite.Interpreter(model_path=local_path)
     interpreter.allocate_tensors()
+
     tflite_cache[model_name] = interpreter
     return interpreter
 
@@ -105,9 +99,9 @@ def preprocess(img, size):
     return np.expand_dims(arr, 0)
 
 
-# ------------------------------
-# API Route
-# ------------------------------
+# -----------------------------
+# PREDICT ROUTE
+# -----------------------------
 @app.route("/predict", methods=["POST"])
 def predict_resnet():
     if "file" not in request.files:
@@ -117,20 +111,16 @@ def predict_resnet():
     selected_class = request.form.get("selected_class", "")
     cname = normalize(selected_class)
 
-    fname = file.filename
-    fpath = os.path.join(UPLOAD_DIR, fname)
+    fpath = os.path.join(UPLOAD_DIR, file.filename)
     file.save(fpath)
 
-    # Get metrics
     class_info = RESNET_JSON.get(cname)
     if class_info is None:
-        return jsonify({"success": False, "error": "Class not in ResNet JSON"})
+        return jsonify({"success": False, "error": "Class not found"})
 
     model_name = class_info["model_used"].lower()
 
     interpreter = load_resnet_model(model_name)
-    if interpreter is None:
-        return jsonify({"success": False, "error": "Failed to load ResNet model"})
 
     input_info = interpreter.get_input_details()[0]
     _, h, w, _ = input_info["shape"]
@@ -148,14 +138,11 @@ def predict_resnet():
     idx = int(np.argmax(preds))
     confidence = float(np.max(preds))
 
+    # decode class
     class_map = RESNET_MODEL_CLASS_INDEX[model_name]
     predicted_label = next(k for k, v in class_map.items() if v == idx)
 
-    # Delete temp upload
-    try:
-        os.remove(fpath)
-    except:
-        pass
+    os.remove(fpath)
 
     return jsonify({
         "success": True,
@@ -164,11 +151,12 @@ def predict_resnet():
         "predicted_label": predicted_label,
         "confidence": confidence,
         "metrics": class_info
-    })
+    }), 200
 
 
-# ------------------------------
-# MAIN
-# ------------------------------
+# -----------------------------
+# RUN (Railway)
+# -----------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
